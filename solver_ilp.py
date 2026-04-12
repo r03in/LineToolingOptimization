@@ -56,6 +56,7 @@ PAR_COST_UPGR_ROW = 51  # cost of upgrading an established line with a new produ
 PAR_COST_MECH_ROW = 52  # cost per mechanical tooling set
 PAR_COST_OPT_ROW  = 53  # cost per optical tooling set
 PAR_COST_VALD_ROW = 54  # validation cost per late product introduction
+PAR_COST_RUN_ROW  = 55  # annual running cost per open line (discourages premature opening)
 
 # 'Tooling' sheet positions
 TOOLING_MECH_ROW = 7    # first mech matrix data row (P1); col 2=P1 … col 11=P10
@@ -68,14 +69,25 @@ ALLOC_DATA_ROW = 6
 # ── Solver configuration (edit these to change behaviour) ─────────────────────
 BASE_OEE               = 0.85   # OEE for single-product lines (default)
 CHANGEOVER_OEE_PENALTY = 0.03   # OEE reduction for lines running 2+ products
-SOLVER_TIME_LIMIT      = 300    # CBC wall-clock limit in seconds
+SOLVER_TIME_LIMIT      = 600    # CBC wall-clock limit in seconds
+
+# Minimum raw utilisation (units×ct / avail) a line 2+ must achieve in the year
+# it first opens. Prevents commissioning a new line before existing lines are at
+# capacity. Line 1 is exempt (opens for validation at tiny initial demand).
+# 30 % is chosen to:
+#   - Block premature openings below this threshold (e.g. a line opening at 28 %)
+#   - Stay well below the ~47 % worst-case overflow of any necessary new line,
+#     so the constraint never causes infeasibility when demand genuinely forces
+#     a new line to open.
+MIN_OPENING_UTIL = 0.30  # 30 % of raw available seconds
 
 # Default costs (USD) — overridden by values in the Parameters sheet
-DEFAULT_COST_LINE       = 3_500_000   # one-time capital per new line opened
+DEFAULT_COST_LINE       =         0   # one-time capital: amortised into annual running cost
 DEFAULT_COST_UPGRADE    =   500_000   # hardware upgrade per product added to established line
 DEFAULT_COST_MECH       =   110_000   # per mechanical tooling set purchased
 DEFAULT_COST_OPT        =   220_000   # per optical tooling set purchased
 DEFAULT_COST_VALIDATION =   100_000   # process validation per late product intro on a line
+DEFAULT_COST_RUNNING    =   500_000   # annual cost per open line ($3.5M capital / 7-yr life)
 
 # ── Product colours for Gantt chart ───────────────────────────────────────────
 PRODUCT_COLORS = [
@@ -137,6 +149,7 @@ def load_inputs(wb):
         'mech':       _cost(PAR_COST_MECH_ROW, DEFAULT_COST_MECH),
         'opt':        _cost(PAR_COST_OPT_ROW,  DEFAULT_COST_OPT),
         'validation': _cost(PAR_COST_VALD_ROW, DEFAULT_COST_VALIDATION),
+        'running':    _cost(PAR_COST_RUN_ROW,  DEFAULT_COST_RUNNING),
     }
 
     return {'years': years, 'demand': demand, 'avail': avail,
@@ -189,10 +202,14 @@ def build_and_solve(inp):
     tooled : list[set]  line -> set of product indices ever run on that line
     intro  : dict       line -> first year the line was used
     """
-    years  = inp['years']
     demand = inp['demand']
     avail  = inp['avail']
     ct     = inp['ct']
+
+    # Only model years that have actual demand — years with zero total demand
+    # cause infeasibility: the no_close constraint (o[l,i] >= o[l,i-1]) would
+    # force lines to stay open while constraint 4 forces o=0 when demand=0.
+    years = [yr for yr in inp['years'] if sum(demand[yr]) > 0]
 
     P = NUM_PRODUCTS
     L = NUM_LINES
@@ -266,11 +283,20 @@ def build_and_solve(inp):
         [l for l in range(L)],
         cat='Binary')
 
-    # late_intro[p,l]  binary: 1 if product p is introduced to line l after
-    # the line's initial commissioning year (triggers upgrade + validation cost)
+    # late_intro[p,l]  binary: 1 if product p is first introduced to line l
+    # after the line was already commissioned (triggers upgrade + validation cost).
+    # Does NOT re-fire if the product stops and restarts — once introduced, always
+    # introduced. Modelled via ever_been_u (see constraint 10).
     late_intro = pulp.LpVariable.dicts(
         'late_intro',
         [(p, l) for p in range(P) for l in range(L)],
+        cat='Binary')
+
+    # ever_been_u[p,l,i]  binary: 1 if product p has run on line l in any year
+    # up to and including year index i. Non-decreasing over time.
+    ever_been_u = pulp.LpVariable.dicts(
+        'ever_been_u',
+        [(p, l, i) for p in range(P) for l in range(L) for i in range(Y)],
         cat='Binary')
 
     costs = inp['costs']
@@ -278,6 +304,8 @@ def build_and_solve(inp):
     # ── Objective  (minimise total USD cost) ──────────────────────────────────
     prob += (
         costs['line']       * pulp.lpSum(ever_open[l] for l in range(L))
+      + costs['running']    * pulp.lpSum(o[l, i]
+                                         for l in range(L) for i in range(Y))
       + (costs['upgrade'] + costs['validation'])
                             * pulp.lpSum(late_intro[p, l]
                                          for p in range(P) for l in range(L))
@@ -332,10 +360,39 @@ def build_and_solve(inp):
                 f'cap_{l}_{i}'
             )
 
-        # 7. Line 1 validation constraint:
-        #    ALL active products MUST be produced on Line 1 every year
-        for p in act:
-            prob += (u[p, 0, i] == 1, f'val1_{p}_{i}')
+
+    # 7. Line 1 validation constraint:
+    #    Each product that is ever demanded must be run on Line 1 at least once
+    #    across the entire planning horizon. Once run, the product is certified on
+    #    that line for life — no annual re-validation required.
+    #    In practice this is satisfied naturally in the first year Line 1 opens
+    #    (2029, tiny demand), so it costs only tooling, no extra line capital.
+    for p in range(P):
+        if any(demand[yr][p] > 0 for yr in years):
+            prob += (
+                pulp.lpSum(u[p, 0, i] for i in range(Y)) >= 1,
+                f'val1_{p}'
+            )
+
+    # 8a. Lines don't close: once a line is open it stays open.
+    #     Realistic (a commissioned production line doesn't disappear) and
+    #     tightens the model significantly.
+    for l in range(L):
+        for i in range(1, Y):
+            prob += (o[l, i] >= o[l, i - 1], f'no_close_{l}_{i}')
+
+    # 8b. Minimum opening-year utilisation for lines 2+ (Line 1 is exempt — it opens
+    #     at tiny demand for initial product validation).
+    #     A new line (o transitions 0→1) must reach MIN_OPENING_UTIL of raw capacity
+    #     in its first year. Prevents commissioning a dedicated line just for OEE gain
+    #     when existing lines still have spare capacity.
+    for l in range(1, L):      # lines 2–15 only
+        for i in range(1, Y):
+            prob += (
+                pulp.lpSum(x[p, l, i] * ct[l][p] for p in range(P))
+                >= MIN_OPENING_UTIL * avail * (o[l, i] - o[l, i - 1]),
+                f'min_open_util_{l}_{i}'
+            )
 
     # 8. Tooling permanence: if product runs on line in any year, family tooling needed
     for f, fam in enumerate(mech_fams):
@@ -355,15 +412,37 @@ def build_and_solve(inp):
         for i in range(Y):
             prob += (ever_open[l] >= o[l, i], f'ever_open_{l}_{i}')
 
-    # 10. late_intro: fires when product p arrives on line l after the line
-    #     was already open (u goes 0→1 while line was open in prior year).
-    #     Constraint: late_intro[p,l] >= u[p,l,i] - u[p,l,i-1] + o[l,i-1] - 1
-    #     RHS = 1 only when product newly assigned AND line already existed.
+    # 10. ever_been_u: non-decreasing indicator of whether product p has ever
+    #     run on line l through year i.
+    #     Lower bounds: must be 1 once u=1 (and stay 1 thereafter).
+    #     Upper bound:  can only be 1 if product has actually run at some point.
+    for p in range(P):
+        for l in range(L):
+            for i in range(Y):
+                # Lower: current production sets the flag
+                prob += (ever_been_u[p, l, i] >= u[p, l, i],
+                         f'ebu_lo_u_{p}_{l}_{i}')
+                # Lower: flag is non-decreasing (once set, stays set)
+                if i > 0:
+                    prob += (ever_been_u[p, l, i] >= ever_been_u[p, l, i - 1],
+                             f'ebu_lo_nd_{p}_{l}_{i}')
+                # Upper: flag can only be 1 if product ran at some point up to i
+                prob += (ever_been_u[p, l, i]
+                         <= pulp.lpSum(u[p, l, j] for j in range(i + 1)),
+                         f'ebu_hi_{p}_{l}_{i}')
+
+    # 11. late_intro: fires on the FIRST introduction of product p to line l
+    #     when the line was already commissioned before that introduction.
+    #     Uses ever_been_u[p,l,i-1] (not u[p,l,i-1]) so that re-introduction
+    #     after a production gap does NOT trigger another charge — once a product
+    #     has run on a line it stays validated there for life.
+    #     RHS = 1 only when: product newly appears (u=1, ever_been=0)
+    #                    AND line was already open (o[l,i-1]=1).
     for p in range(P):
         for l in range(L):
             for i in range(1, Y):
                 prob += (late_intro[p, l]
-                         >= u[p, l, i] - u[p, l, i - 1] + o[l, i - 1] - 1,
+                         >= u[p, l, i] - ever_been_u[p, l, i - 1] + o[l, i - 1] - 1,
                          f'late_intro_{p}_{l}_{i}')
 
     # ── Solve ─────────────────────────────────────────────────────────────────
@@ -407,18 +486,21 @@ def build_and_solve(inp):
         1 for f in range(OF) for l in range(L)
         if pulp.value(to_[f, l]) is not None and pulp.value(to_[f, l]) > 0.5
     )
-    n_lines_opened = sum(
-        1 for l in range(L)
-        if pulp.value(ever_open[l]) is not None and pulp.value(ever_open[l]) > 0.5
-    )
+    # Count lines that actually ever produced (not the ever_open variable, which
+    # defaults to 1 for all lines when DEFAULT_COST_LINE=0 and costs nothing)
+    n_lines_opened = len(intro)
     n_late_intros = sum(
         1 for p in range(P) for l in range(L)
         if pulp.value(late_intro[p, l]) is not None and pulp.value(late_intro[p, l]) > 0.5
     )
+    n_line_years = sum(
+        1 for l in range(L) for i in range(Y)
+        if pulp.value(o[l, i]) is not None and pulp.value(o[l, i]) > 0.5
+    )
 
     return (alloc, tooled, intro,
             mech_sets, opt_sets, mech_fams, opt_fams,
-            n_lines_opened, n_late_intros)
+            n_lines_opened, n_late_intros, n_line_years)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -516,10 +598,19 @@ def write_output(wb, alloc, tooled, intro, inp, mech_sets, opt_sets, ok):
     ct     = inp['ct']
     avail  = inp['avail']
 
-    # Clear old data rows (rows ALLOC_DATA_ROW onward)
-    for r in range(ALLOC_DATA_ROW, ALLOC_DATA_ROW + 500):
+    # Clear old data rows (rows ALLOC_DATA_ROW onward).
+    # Unmerge any merged regions that overlap this range first, then clear.
+    from openpyxl.cell import MergedCell
+    clear_start = ALLOC_DATA_ROW
+    clear_end   = ALLOC_DATA_ROW + 500
+    for rng in list(ws.merged_cells.ranges):
+        if rng.min_row <= clear_end and rng.max_row >= clear_start:
+            ws.unmerge_cells(str(rng))
+    for r in range(clear_start, clear_end):
         for c in range(1, 18):
             cell = ws.cell(row=r, column=c)
+            if isinstance(cell, MergedCell):
+                continue
             cell.value  = None
             cell.fill   = _ofill('FFFFFF')
             cell.border = _oborder()
@@ -714,12 +805,19 @@ def write_report_sheet(wb, alloc, tooled, intro, mech_fams, opt_fams,
     ct     = inp['ct']
     avail  = inp['avail']
 
-    # Clear everything from row 2 downward
+    # Clear everything from row 2 downward; unmerge first to avoid MergedCell errors.
+    from openpyxl.cell import MergedCell
+    for rng in list(ws.merged_cells.ranges):
+        if rng.max_row >= 2:
+            ws.unmerge_cells(str(rng))
     for r in range(2, 200):
         for c in range(1, 10):
-            ws.cell(row=r, column=c).value  = None
-            ws.cell(row=r, column=c).fill   = _ofill('FFFFFF')
-            ws.cell(row=r, column=c).border = _oborder()
+            cell = ws.cell(row=r, column=c)
+            if isinstance(cell, MergedCell):
+                continue
+            cell.value  = None
+            cell.fill   = _ofill('FFFFFF')
+            cell.border = _oborder()
 
     from openpyxl.styles import PatternFill, Font, Border, Side, Alignment
     def _rfill(h): return PatternFill('solid', fgColor=h)
@@ -951,7 +1049,7 @@ def main():
         sys.exit(1)
 
     alloc, tooled, intro, mech_sets, opt_sets, mech_fams, opt_fams, \
-        n_lines_opened, n_late_intros = result
+        n_lines_opened, n_late_intros, n_line_years = result
 
     print('\nVerifying solution ...')
     ok = verify(alloc, inp)
@@ -962,13 +1060,15 @@ def main():
     print(f'  (greedy baseline: 19+19=38  |  theory min: 14+14=28)')
 
     costs = inp['costs']
-    cost_lines  = costs['line']       * n_lines_opened
-    cost_late   = (costs['upgrade'] + costs['validation']) * n_late_intros
-    cost_mech   = costs['mech']      * mech_sets
-    cost_opt    = costs['opt']       * opt_sets
-    total_cost  = cost_lines + cost_late + cost_mech + cost_opt
+    cost_lines   = costs['line']       * n_lines_opened
+    cost_running = costs['running']    * n_line_years
+    cost_late    = (costs['upgrade'] + costs['validation']) * n_late_intros
+    cost_mech    = costs['mech']      * mech_sets
+    cost_opt     = costs['opt']       * opt_sets
+    total_cost   = cost_lines + cost_running + cost_late + cost_mech + cost_opt
     print(f'\nCost breakdown:')
     print(f'  Lines opened      : {n_lines_opened}  × ${costs["line"]:,.0f}  = ${cost_lines:,.0f}')
+    print(f'  Running cost      : {n_line_years} line-years × ${costs["running"]:,.0f}  = ${cost_running:,.0f}')
     print(f'  Late intros       : {n_late_intros}  × ${costs["upgrade"]+costs["validation"]:,.0f}  = ${cost_late:,.0f}')
     print(f'  Mech tooling sets : {mech_sets}  × ${costs["mech"]:,.0f}  = ${cost_mech:,.0f}')
     print(f'  Opt  tooling sets : {opt_sets}  × ${costs["opt"]:,.0f}  = ${cost_opt:,.0f}')

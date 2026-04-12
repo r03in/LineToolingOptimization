@@ -49,6 +49,7 @@ PAR_COST_UPGR_ROW = 51  # cost of upgrading an existing line (new product, estab
 PAR_COST_MECH_ROW = 52  # cost per mechanical tooling set
 PAR_COST_OPT_ROW  = 53  # cost per optical tooling set
 PAR_COST_VALD_ROW = 54  # validation cost per late product introduction
+PAR_COST_RUN_ROW  = 55  # annual running cost per open line (discourages premature opening)
 
 # 'Tooling' sheet
 TOO_MECH_HDR_ROW  = 6   # col-header row, mech matrix
@@ -444,11 +445,12 @@ def _build_parameters(wb, data):
     # ── Cost Parameters ────────────────────────────────────────────────────────
     _sect(ws, PAR_COST_HDR_ROW, '  COST PARAMETERS  (USD)', ncols=3)
     cost_rows = [
-        (PAR_COST_LINE_ROW, 'Cost of new production line',           3_500_000, '$#,##0', 'USD / line'),
-        (PAR_COST_UPGR_ROW, 'Cost of line upgrade (new product)',       500_000, '$#,##0', 'USD / upgrade'),
-        (PAR_COST_MECH_ROW, 'Mechanical tooling set cost',              110_000, '$#,##0', 'USD / set'),
-        (PAR_COST_OPT_ROW,  'Optical tooling set cost',                 220_000, '$#,##0', 'USD / set'),
-        (PAR_COST_VALD_ROW, 'Validation cost (late product intro)',      100_000, '$#,##0', 'USD / event'),
+        (PAR_COST_LINE_ROW, 'One-time line cost (0 = use annual running)',         0, '$#,##0', 'USD / line'),
+        (PAR_COST_UPGR_ROW, 'Cost of line upgrade (new product on est. line)', 500_000, '$#,##0', 'USD / upgrade'),
+        (PAR_COST_MECH_ROW, 'Mechanical tooling set cost',                     110_000, '$#,##0', 'USD / set'),
+        (PAR_COST_OPT_ROW,  'Optical tooling set cost',                        220_000, '$#,##0', 'USD / set'),
+        (PAR_COST_VALD_ROW, 'Validation cost (late product intro)',             100_000, '$#,##0', 'USD / event'),
+        (PAR_COST_RUN_ROW,  'Annual running cost per open line ($3.5M / 7yr)', 500_000, '$#,##0', 'USD / line / year'),
     ]
     for cost_row, label, val, fmt, unit in cost_rows:
         ws.cell(row=cost_row, column=1).value     = label
