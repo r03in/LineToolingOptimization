@@ -30,17 +30,35 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
-# ── Sheet / grid constants (match Book.xlsx layout) ───────────────────────────
-SHEET_NAME   = 'Blad1'
+# ── Sheet names (Solver.xlsx layout — created by create_solver_xlsx.py) ───────
+DEMAND_SHEET  = 'Demand'
+PARAMS_SHEET  = 'Parameters'
+TOOLING_SHEET = 'Tooling'
+ALLOC_SHEET   = 'Allocation'
+REPORT_SHEET  = 'Report'
+
 NUM_PRODUCTS = 10
 NUM_LINES    = 15
-DEMAND_START = 3
-DEMAND_END   = 19
-CT_START     = 31   # cycle-time matrix: row CT_START + line_idx, col 3 + prod_idx
-OEE_START    = 49   # OEE matrix
-MECH_START   = 70   # mechanical tooling compatibility matrix
-OPT_START    = 84   # optical  tooling compatibility matrix
-OUTPUT_START = 98   # first data row of output grid
+
+# 'Demand' sheet positions
+DEM_DATA_ROW = 5    # first data row (year 2025); col 1=year, col 2=P1 … col 11=P10
+
+# 'Parameters' sheet positions
+PAR_HOURS_ROW    = 4    # hours/shift value in col B
+PAR_SHIFTS_ROW   = 5
+PAR_DAYS_ROW     = 6
+PAR_WEEKS_ROW    = 7
+PAR_VAL_COL      = 2
+PAR_CT_DATA_ROW  = 14   # first cycle-time data row (Line 1); col 2=P1 … col 11=P10
+PAR_OEE_DATA_ROW = 33   # first OEE data row (Line 1)
+
+# 'Tooling' sheet positions
+TOOLING_MECH_ROW = 7    # first mech matrix data row (P1); col 2=P1 … col 11=P10
+TOOLING_OPT_ROW  = 21   # first optical matrix data row (P1)
+
+# 'Allocation' sheet output positions
+ALLOC_HDR_ROW  = 5
+ALLOC_DATA_ROW = 6
 
 # ── Solver configuration (edit these to change behaviour) ─────────────────────
 BASE_OEE               = 0.85   # OEE for single-product lines (default)
@@ -59,32 +77,45 @@ PRODUCT_COLORS = [
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# INPUT LOADING
+# INPUT LOADING  (reads from Solver.xlsx multi-sheet layout)
 # ─────────────────────────────────────────────────────────────────────────────
 def load_inputs(wb):
-    """Read all inputs from the Blad1 sheet and return a dict."""
-    ws = wb[SHEET_NAME]
+    """Read all inputs from the Solver.xlsx sheet layout and return a dict."""
+    ws_d = wb[DEMAND_SHEET]
+    ws_p = wb[PARAMS_SHEET]
+    ws_t = wb[TOOLING_SHEET]
+
+    # Production setup → available seconds per year
     setup = {
-        'hours':  float(ws['B22'].value or 0),
-        'shifts': float(ws['B23'].value or 0),
-        'days':   float(ws['B24'].value or 0),
-        'weeks':  float(ws['B25'].value or 0),
+        'hours':  float(ws_p.cell(row=PAR_HOURS_ROW,  column=PAR_VAL_COL).value or 0),
+        'shifts': float(ws_p.cell(row=PAR_SHIFTS_ROW, column=PAR_VAL_COL).value or 0),
+        'days':   float(ws_p.cell(row=PAR_DAYS_ROW,   column=PAR_VAL_COL).value or 0),
+        'weeks':  float(ws_p.cell(row=PAR_WEEKS_ROW,  column=PAR_VAL_COL).value or 0),
     }
     avail = setup['hours'] * setup['shifts'] * setup['days'] * setup['weeks'] * 3600
 
+    # Demand: scan rows from DEM_DATA_ROW until year column is empty
     years, demand = [], {}
-    for r in range(DEMAND_START, DEMAND_END + 1):
-        yr = ws.cell(row=r, column=2).value
+    for r in range(DEM_DATA_ROW, DEM_DATA_ROW + 50):
+        yr = ws_d.cell(row=r, column=1).value
         if yr is None:
-            continue
+            break
         yr = int(yr)
         years.append(yr)
-        demand[yr] = [int(ws.cell(row=r, column=c).value or 0) for c in range(3, 13)]
+        demand[yr] = [int(ws_d.cell(row=r, column=2 + p).value or 0)
+                      for p in range(10)]
 
-    ct  = [[ws.cell(row=CT_START  + l, column=3 + p).value or 12   for p in range(10)] for l in range(15)]
-    oee = [[ws.cell(row=OEE_START + l, column=3 + p).value or 0.85 for p in range(10)] for l in range(15)]
-    mt  = [[ws.cell(row=MECH_START + i, column=3 + j).value or 0   for j in range(10)] for i in range(10)]
-    ot  = [[ws.cell(row=OPT_START  + i, column=3 + j).value or 0   for j in range(10)] for i in range(10)]
+    # Cycle times and OEE: col 2 = P1 … col 11 = P10
+    ct  = [[ws_p.cell(row=PAR_CT_DATA_ROW  + l, column=2 + p).value or 12
+            for p in range(10)] for l in range(15)]
+    oee = [[ws_p.cell(row=PAR_OEE_DATA_ROW + l, column=2 + p).value or 0.85
+            for p in range(10)] for l in range(15)]
+
+    # Tooling compatibility matrices: col 2 = P1 … col 11 = P10
+    mt  = [[ws_t.cell(row=TOOLING_MECH_ROW + i, column=2 + j).value or 0
+            for j in range(10)] for i in range(10)]
+    ot  = [[ws_t.cell(row=TOOLING_OPT_ROW  + i, column=2 + j).value or 0
+            for j in range(10)] for i in range(10)]
 
     return {'years': years, 'demand': demand, 'avail': avail,
             'ct': ct, 'oee': oee, 'mt': mt, 'ot': ot}
@@ -406,23 +437,103 @@ def compute_tooling_ids(alloc, tooled, intro, mech_fams, opt_fams, years):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# EXCEL OUTPUT  (unchanged grid format for downstream compatibility)
+# EXCEL OUTPUT  (formatted table written to Allocation sheet)
 # ─────────────────────────────────────────────────────────────────────────────
-def write_output(ws, alloc, years):
-    # Clear grid first
-    for r in range(OUTPUT_START, OUTPUT_START + len(years)):
-        for c in range(3, 3 + NUM_LINES * NUM_PRODUCTS):
-            ws.cell(row=r, column=c).value = None
-    n = 0
+def _ofill(hex_color):
+    from openpyxl.styles import PatternFill
+    return PatternFill('solid', fgColor=hex_color)
+
+def _ofont(bold=False, size=10, color='1F1F1F'):
+    from openpyxl.styles import Font
+    return Font(name='Calibri', bold=bold, size=size, color=color)
+
+def _oborder():
+    from openpyxl.styles import Border, Side
+    t = Side(style='thin', color='B8CCE4')
+    return Border(left=t, right=t, top=t, bottom=t)
+
+def _oal(h='left'):
+    from openpyxl.styles import Alignment
+    return Alignment(horizontal=h, vertical='center')
+
+
+def write_output(wb, alloc, tooled, intro, inp, mech_sets, opt_sets, ok):
+    """Write formatted allocation table to the Allocation sheet in wb."""
+    import datetime
+    ws     = wb[ALLOC_SHEET]
+    years  = inp['years']
+    demand = inp['demand']
+    ct     = inp['ct']
+    avail  = inp['avail']
+
+    # Clear old data rows (rows ALLOC_DATA_ROW onward)
+    for r in range(ALLOC_DATA_ROW, ALLOC_DATA_ROW + 500):
+        for c in range(1, 18):
+            cell = ws.cell(row=r, column=c)
+            cell.value  = None
+            cell.fill   = _ofill('FFFFFF')
+            cell.border = _oborder()
+
+    # Update subtitle row (row 2) with run metadata
+    ts     = datetime.datetime.now().strftime('%Y-%m-%d  %H:%M')
+    status = '✓  All checks passed' if ok else '⚠  Issues found — see console'
+    from openpyxl.styles import Font
+    ws.cell(row=2, column=1).value = (
+        f'Last run: {ts}   |   {status}   |   '
+        f'{mech_sets} mech + {opt_sets} opt = {mech_sets + opt_sets} tooling sets'
+    )
+    ws.cell(row=2, column=1).font = Font(name='Calibri', italic=True,
+                                         size=10, color='595959')
+
+    C_EVEN = 'E2EFDA'   # light green
+    C_ODD  = 'F0F8F0'   # slightly lighter green
+    row = ALLOC_DATA_ROW
+    alt = False
     for yr in years:
-        row = OUTPUT_START + (yr - years[0])
-        for line in range(NUM_LINES):
-            for prod in range(NUM_PRODUCTS):
-                v = alloc.get((yr, line, prod), 0)
-                if v > 0:
-                    ws.cell(row=row, column=3 + line * 10 + prod).value = v
-                    n += 1
-    return n
+        d = demand.get(yr, [0] * 10)
+        if sum(d) == 0:
+            continue
+        active_lines = sorted({l for (y2, l, _) in alloc if y2 == yr})
+        for l in active_lines:
+            units  = [alloc.get((yr, l, p), 0) for p in range(NUM_PRODUCTS)]
+            total  = sum(units)
+            prods  = '+'.join(f'P{p+1}' for p in range(NUM_PRODUCTS)
+                              if units[p] > 0)
+            n_prod = sum(1 for p in range(NUM_PRODUCTS) if units[p] > 0)
+            t_used = sum(units[p] * ct[l][p] for p in range(NUM_PRODUCTS))
+            util   = round(t_used / avail * 100, 1)
+            oee_e  = int(round((BASE_OEE - CHANGEOVER_OEE_PENALTY
+                                if n_prod > 1 else BASE_OEE) * 100))
+            bg = C_ODD if alt else C_EVEN
+
+            vals = (
+                [yr, f'L{l+1}', intro.get(l, ''), prods]
+                + [units[p] if units[p] > 0 else None
+                   for p in range(NUM_PRODUCTS)]
+                + [total, util, oee_e]
+            )
+            for ci, v in enumerate(vals, 1):
+                cell            = ws.cell(row=row, column=ci)
+                cell.value      = v
+                cell.fill       = _ofill(bg)
+                cell.font       = _ofont(bold=(ci == 1))
+                cell.border     = _oborder()
+                cell.alignment  = _oal(
+                    'center' if ci <= 3 else
+                    'right'  if ci >= 5 else
+                    'left'
+                )
+                if ci >= 5 and ci <= 14:
+                    cell.number_format = '#,##0'
+                elif ci == 15:
+                    cell.number_format = '#,##0'
+                elif ci == 16:
+                    cell.number_format = '0.0'
+            ws.row_dimensions[row].height = 15
+            row += 1
+            alt = not alt
+
+    return row - ALLOC_DATA_ROW
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -540,6 +651,137 @@ def plot_gantt(alloc, inp, intro, out_path):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# REPORT SHEET
+# ─────────────────────────────────────────────────────────────────────────────
+def write_report_sheet(wb, alloc, tooled, intro, mech_fams, opt_fams,
+                       mech_sets, opt_sets, inp, ok):
+    """Write lines summary, tooling ID registry, and demand validation."""
+    import datetime
+    ws     = wb[REPORT_SHEET]
+    years  = inp['years']
+    demand = inp['demand']
+    ct     = inp['ct']
+    avail  = inp['avail']
+
+    # Clear everything from row 2 downward
+    for r in range(2, 200):
+        for c in range(1, 10):
+            ws.cell(row=r, column=c).value  = None
+            ws.cell(row=r, column=c).fill   = _ofill('FFFFFF')
+            ws.cell(row=r, column=c).border = _oborder()
+
+    from openpyxl.styles import PatternFill, Font, Border, Side, Alignment
+    def _rfill(h): return PatternFill('solid', fgColor=h)
+    def _rfont(bold=False, sz=10, color='1F1F1F'):
+        return Font(name='Calibri', bold=bold, size=sz, color=color)
+    def _rbd():
+        t = Side(style='thin', color='B8CCE4')
+        return Border(left=t, right=t, top=t, bottom=t)
+    def _ral(h='left'):
+        return Alignment(horizontal=h, vertical='center')
+    def _sect_r(row, text, ncols=7):
+        ws.cell(row=row, column=1).value = text
+        ws.cell(row=row, column=1).font  = Font(name='Calibri', bold=True,
+                                                size=11, color='FFFFFF')
+        for c in range(1, ncols + 1):
+            ws.cell(row=row, column=c).fill = _rfill('2E75B6')
+        ws.merge_cells(start_row=row, start_column=1,
+                       end_row=row, end_column=ncols)
+        ws.row_dimensions[row].height = 20
+    def _hdr_r(row, labels):
+        for i, lbl in enumerate(labels):
+            c = ws.cell(row=row, column=1 + i)
+            c.value, c.font, c.fill, c.border, c.alignment = \
+                lbl, _rfont(bold=True), _rfill('BDD7EE'), _rbd(), _ral('center')
+        ws.row_dimensions[row].height = 18
+    def _data_r(row, vals, bg='E2EFDA'):
+        for i, v in enumerate(vals):
+            c = ws.cell(row=row, column=1 + i)
+            c.value, c.fill, c.font, c.border = v, _rfill(bg), _rfont(), _rbd()
+            c.alignment = _ral('right' if isinstance(v, (int, float)) else 'left')
+        ws.row_dimensions[row].height = 15
+
+    ts = datetime.datetime.now().strftime('%Y-%m-%d  %H:%M')
+    ws.cell(row=2, column=1).value = (
+        f'Last run: {ts}   |   '
+        f'{"✓  All OK" if ok else "⚠  Issues found"}   |   '
+        f'{mech_sets} mech + {opt_sets} opt = {mech_sets + opt_sets} sets total'
+    )
+    ws.cell(row=2, column=1).font = Font(name='Calibri', italic=True,
+                                         size=10, color='595959')
+    ws.merge_cells('A2:G2')
+    ws.row_dimensions[3].height = 6
+
+    # ── Lines summary ─────────────────────────────────────────────────────────
+    _sect_r(4, '  LINES SUMMARY')
+    _hdr_r(5, ['Line', 'Intro', 'Products', 'Tooling sets', 'Eff. OEE %',
+               'Peak util %', 'Peak year'])
+    r = 6
+    for l in sorted(intro.keys()):
+        ps     = sorted(f'P{p+1}' for p in tooled[l])
+        n_prod = len(ps)
+        oee    = int(round((BASE_OEE - CHANGEOVER_OEE_PENALTY
+                            if n_prod > 1 else BASE_OEE) * 100))
+        # Count tooling sets for this line
+        mf_cnt = sum(1 for f, fam in enumerate(mech_fams) if fam & tooled[l])
+        of_cnt = sum(1 for f, fam in enumerate(opt_fams)  if fam & tooled[l])
+        # Peak utilisation
+        peak_util, peak_yr = 0.0, ''
+        for yr in years:
+            d = demand.get(yr, [0] * 10)
+            if sum(d) == 0:
+                continue
+            t = sum(alloc.get((yr, l, p), 0) * ct[l][p] for p in range(NUM_PRODUCTS))
+            u = t / avail * 100
+            if u > peak_util:
+                peak_util, peak_yr = u, yr
+        bg = 'F0F8F0' if r % 2 else 'E2EFDA'
+        _data_r(r, [f'L{l+1}', intro[l], '+'.join(ps),
+                    f'{mf_cnt}m + {of_cnt}o', oee,
+                    round(peak_util, 1), peak_yr], bg=bg)
+        r += 1
+
+    r += 1  # spacer
+    # ── Tooling ID registry ───────────────────────────────────────────────────
+    _sect_r(r, '  TOOLING ID REGISTRY'); r += 1
+    _hdr_r(r, ['Tooling ID', 'Type', 'Line', 'Intro year', 'Active years']); r += 1
+    tooling_records = compute_tooling_ids(
+        alloc, tooled, intro, mech_fams, opt_fams, years)
+    for i, rec in enumerate(tooling_records):
+        bg = 'F0F8F0' if i % 2 else 'E2EFDA'
+        _data_r(r, [rec['id'], rec['type'], f"L{rec['line']}",
+                    rec['intro'], rec['year_range']], bg=bg)
+        r += 1
+
+    r += 1  # spacer
+    # ── Demand validation ─────────────────────────────────────────────────────
+    _sect_r(r, '  DEMAND VALIDATION'); r += 1
+    _hdr_r(r, ['Year', 'Product', 'Demand', 'Allocated', 'Difference', 'Status']); r += 1
+    issues = 0
+    for yr in years:
+        d = demand.get(yr, [0] * 10)
+        if sum(d) == 0:
+            continue
+        for p in range(NUM_PRODUCTS):
+            alloc_p = sum(alloc.get((yr, l, p), 0) for l in range(NUM_LINES))
+            diff    = alloc_p - d[p]
+            if d[p] == 0 and alloc_p == 0:
+                continue
+            ok_row = abs(diff) <= 1
+            if not ok_row:
+                issues += 1
+            bg = 'E2EFDA' if ok_row else 'FFC7CE'
+            _data_r(r, [yr, f'P{p+1}', d[p], alloc_p, diff,
+                        'OK' if ok_row else 'MISMATCH'], bg=bg)
+            r += 1
+    if issues == 0:
+        ws.cell(row=r, column=1).value = '✓  All demand satisfied within ±1 unit tolerance.'
+        ws.cell(row=r, column=1).font = Font(name='Calibri', italic=True,
+                                             size=10, color='2E75B6')
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=6)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # VERIFICATION  (demand met & capacity not exceeded)
 # ─────────────────────────────────────────────────────────────────────────────
 def verify(alloc, inp):
@@ -579,12 +821,13 @@ def verify(alloc, inp):
 # ─────────────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description='Production line ILP optimizer')
-    parser.add_argument('workbook', nargs='?', default='Book.xlsx')
+    parser.add_argument('workbook', nargs='?', default='Solver.xlsx')
     args = parser.parse_args()
 
     path = Path(args.workbook)
     if not path.exists():
         print(f'Error: {path} not found')
+        print('  Run  python create_solver_xlsx.py  to generate Solver.xlsx first.')
         sys.exit(1)
 
     print(f'Loading {path} ...')
@@ -597,7 +840,6 @@ def main():
     print(f'  BASE_OEE               : {BASE_OEE*100:.0f}%')
     print(f'  CHANGEOVER_OEE_PENALTY : {CHANGEOVER_OEE_PENALTY*100:.0f}%')
 
-    # Quick sanity: show tooling family counts
     mf_preview = compute_families(inp['mt'], NUM_PRODUCTS)
     of_preview = compute_families(inp['ot'], NUM_PRODUCTS)
     print(f'  Mech tooling families  : {len(mf_preview)}'
@@ -619,15 +861,15 @@ def main():
 
     total_sets = mech_sets + opt_sets
     print(f'\nTooling: {mech_sets} mech + {opt_sets} opt = {total_sets} sets')
-    print(f'  (greedy baseline: 19 mech + 19 opt = 38 sets  |  theory min: 14+14=28)')
+    print(f'  (greedy baseline: 19+19=38  |  theory min: 14+14=28)')
 
     print('\nLines used:')
     for l in sorted(intro.keys()):
-        ps     = sorted(f'P{p+1}' for p in tooled[l])
-        n_prod = len(ps)
-        oee    = (BASE_OEE - CHANGEOVER_OEE_PENALTY if n_prod > 1 else BASE_OEE) * 100
+        ps    = sorted(f'P{p+1}' for p in tooled[l])
+        n_p   = len(ps)
+        oee_e = (BASE_OEE - CHANGEOVER_OEE_PENALTY if n_p > 1 else BASE_OEE) * 100
         print(f'  Line {l+1:2d}  intro={intro[l]}  products={ps}'
-              f'  effective_OEE={oee:.0f}%')
+              f'  effective_OEE={oee_e:.0f}%')
 
     print('\nPer-year summary:')
     for yr in years:
@@ -635,24 +877,22 @@ def main():
         if sum(d) == 0:
             continue
         active_lines = sorted({l for (y2, l, _) in alloc if y2 == yr})
-        parts = []
-        for l in active_lines:
-            prods = [f'P{p+1}' for p in range(NUM_PRODUCTS)
-                     if alloc.get((yr, l, p), 0) > 0]
-            parts.append(f'L{l+1}=[{",".join(prods)}]')
+        parts = [f'L{l+1}=[{",".join(f"P{p+1}" for p in range(NUM_PRODUCTS) if alloc.get((yr,l,p),0)>0)}]'
+                 for l in active_lines]
         print(f'  {yr}: {", ".join(parts)}  —  {len(active_lines)} line(s)')
 
-    # Build tooling ID records
-    tooling_records = compute_tooling_ids(
-        alloc, tooled, intro, mech_fams, opt_fams, years)
-
-    print('\nGenerating outputs ...')
+    print('\nWriting outputs to workbook ...')
     outdir = path.parent
 
-    ws = wb[SHEET_NAME]
-    n_cells = write_output(ws, alloc, years)
-    print(f'  Excel grid: {n_cells} cells written')
+    n_rows = write_output(wb, alloc, tooled, intro, inp, mech_sets, opt_sets, ok)
+    print(f'  Allocation sheet: {n_rows} rows written')
 
+    write_report_sheet(wb, alloc, tooled, intro, mech_fams, opt_fams,
+                       mech_sets, opt_sets, inp, ok)
+    print('  Report sheet: written')
+
+    tooling_records = compute_tooling_ids(
+        alloc, tooled, intro, mech_fams, opt_fams, years)
     write_summary_csv(alloc, tooling_records, inp, intro,
                       str(outdir / 'tooling_summary.csv'))
     plot_gantt(alloc, inp, intro, str(outdir / 'line_gantt.png'))

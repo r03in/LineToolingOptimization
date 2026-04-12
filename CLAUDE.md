@@ -115,35 +115,49 @@ across lines, requiring more tooling sets per line.
 
 ```
 LineToolingOptimization/
-├── Book.xlsx             — Excel workbook: all inputs, output grid, validation, summary
-├── solver_ilp.py         — ILP solver (primary) — reads Book.xlsx, writes 3 outputs
+├── Solver.xlsx           — Primary workbook: inputs + solver output (6 sheets)
+├── solver_ilp.py         — ILP solver — reads Solver.xlsx, writes back + side files
+├── create_solver_xlsx.py — One-time script: generates Solver.xlsx from scratch
 ├── solver_greedy.py      — Original greedy solver (reference / fallback)
-├── solver.py             — Alias kept for compatibility (same as solver_greedy.py)
+├── solver.py             — Legacy alias (same as solver_greedy.py)
 ├── requirements.txt      — Python dependencies: pulp, matplotlib, openpyxl
 └── CLAUDE.md             — This file
 ```
 
-Generated outputs (written to the same directory as the workbook):
+Solver.xlsx sheets:
+
+| Sheet | Purpose | Edit? |
+|-------|---------|-------|
+| Instructions | Overview and usage guide | No |
+| Demand | Annual unit demand 2025-2041 per product | Yes (yellow cells) |
+| Parameters | Setup, cycle times (s/unit), OEE per line | Yes (yellow cells) |
+| Tooling | Mech + optical compatibility matrices (10×10) | Yes (yellow cells) |
+| Allocation | Solver output: allocation table | No — overwritten by solver |
+| Report | Solver output: lines summary, tooling IDs, validation | No — overwritten by solver |
+
+Generated side files (written to same directory as Solver.xlsx):
 
 ```
-tooling_summary.csv   — Allocation per line/year + physical tooling ID table
+tooling_summary.csv   — Allocation per (line, year) + tooling ID registry
 line_gantt.png        — Gantt chart: products per line across all years
-Book.xlsx             — Updated with allocation grid (Blad1 rows 98+)
 ```
 
-## How to Run (ILP Solver)
+## How to Run
 
 ```bash
-# 1. Install dependencies (once)
+# One-time setup
 pip install -r requirements.txt
 
-# 2. Run the ILP solver
-python solver_ilp.py Book.xlsx
+# Generate Solver.xlsx (copies data from Book.xlsx if present, else uses defaults)
+python create_solver_xlsx.py
 
-# 3. Check console output for tooling count and per-year summary
-# 4. Open tooling_summary.csv for detailed line/year allocation + tooling IDs
-# 5. Open line_gantt.png for visual overview
-# 6. Open Book.xlsx → Blad1 validation rows 119-135 (all should show OK)
+# Run the ILP solver
+python solver_ilp.py Solver.xlsx
+
+# Review results
+#   → Allocation sheet: units per line/year, utilisation, OEE
+#   → Report sheet: lines summary, MECH-P01/OPTI-P01 registry, demand validation
+#   → tooling_summary.csv, line_gantt.png
 ```
 
 ## ILP Solver — Key Features
