@@ -162,10 +162,20 @@ python solver_ilp.py Solver.xlsx
 
 ## ILP Solver — Key Features
 
-### Optimisation Objective (priority order)
-1. **Minimise total lines** open across all years (`W_LINES = 10,000`)
-2. **Minimise tooling sets** — one set per tooling *family* per line, not per product (`W_TOOLING = 100`)
-3. **Minimise product-line switches** — penalises moving a product to a different line year-over-year (`W_SWITCHES = 1`)
+### Optimisation Objective — Minimise Total Cost (USD)
+The solver minimises actual capital and operational costs, not proxy weights:
+
+| Cost component | Variable | Default |
+|---|---|---|
+| New production line capital | `ever_open[l]` binary — 1 if line l ever opened | $3,500,000 |
+| Line upgrade (new product on established line) | `late_intro[p,l]` binary | $500,000 |
+| Validation (late product intro on existing line) | `late_intro[p,l]` binary | $100,000 |
+| Mechanical tooling set | `tm[f,l]` binary — 1 set per family per line | $110,000 |
+| Optical tooling set | `to[f,l]` binary — 1 set per family per line | $220,000 |
+
+`late_intro[p,l]` fires when product p is assigned to line l *after* that line was already commissioned — triggering both the upgrade cost and the validation cost simultaneously.
+
+All cost inputs are editable in the **Parameters → COST PARAMETERS** section of Solver.xlsx (yellow cells, rows 50-54).
 
 ### Tooling Sharing
 Reads the 10×10 mechanical and optical compatibility matrices from Blad1. Computes connected
@@ -194,15 +204,25 @@ Each tooling set is named by product family and type:
 The `tooling_summary.csv` shows which line each ID sits on and the years it is active,
 making it easy to track tooling movement between lines across years.
 
-## Configurable Parameters (top of solver_ilp.py)
+## Configurable Parameters
 
+### In Solver.xlsx → Parameters sheet (yellow cells)
+| Parameter | Default | Where |
+|-----------|---------|-------|
+| Hours/shift, shifts/day, days/week, weeks/year | 7.2, 3, 6, 48 | rows 4-7 |
+| Cycle time (s/unit) per line per product | 12.0 | rows 14-28 |
+| OEE per line per product | 0.85 | rows 33-47 |
+| Cost of new production line | $3,500,000 | row 50 |
+| Cost of line upgrade (new product on established line) | $500,000 | row 51 |
+| Mechanical tooling set cost | $110,000 | row 52 |
+| Optical tooling set cost | $220,000 | row 53 |
+| Validation cost (late product intro) | $100,000 | row 54 |
+
+### In solver_ilp.py (code constants)
 | Parameter | Default | Effect |
 |-----------|---------|--------|
 | `BASE_OEE` | 0.85 | OEE for single-product lines |
 | `CHANGEOVER_OEE_PENALTY` | 0.03 | OEE reduction for multi-product lines |
-| `W_LINES` | 10,000 | Objective weight: minimise open lines |
-| `W_TOOLING` | 100 | Objective weight: minimise tooling sets |
-| `W_SWITCHES` | 1 | Objective weight: minimise product-line changes |
 | `SOLVER_TIME_LIMIT` | 300 | CBC solver wall-clock limit (seconds) |
 | `NUM_LINES` | 15 | Maximum lines available |
 | `NUM_PRODUCTS` | 10 | Maximum products supported |
@@ -221,7 +241,7 @@ making it easy to track tooling movement between lines across years.
 - No multi-year demand smoothing; each year is an independent constraint block
 - No minimum lot size or campaign-length constraints
 - No changeover *time* (only OEE penalty); add a changeover matrix if needed later
-- Tooling movement between lines has no cost penalty currently
+- Tooling movement between lines has no physical-move cost; `late_intro` captures new introductions but not re-introduction of a previously-removed product set
 
 ## Demand Summary (2025-2041, active products P1-P4 only)
 

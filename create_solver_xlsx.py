@@ -42,6 +42,13 @@ PAR_CT_DATA_ROW  = 14   # first CT data row  (Line 1)
 PAR_OEE_HDR_ROW  = 32   # col-header row for OEE matrix
 PAR_OEE_DATA_ROW = 33   # first OEE data row (Line 1)
 # col 1=Line-label  col 2=P1  …  col 11=P10
+# Cost section: rows 49-54
+PAR_COST_HDR_ROW  = 49  # cost section banner
+PAR_COST_LINE_ROW = 50  # cost of a new production line
+PAR_COST_UPGR_ROW = 51  # cost of upgrading an existing line (new product, established line)
+PAR_COST_MECH_ROW = 52  # cost per mechanical tooling set
+PAR_COST_OPT_ROW  = 53  # cost per optical tooling set
+PAR_COST_VALD_ROW = 54  # validation cost per late product introduction
 
 # 'Tooling' sheet
 TOO_MECH_HDR_ROW  = 6   # col-header row, mech matrix
@@ -237,9 +244,10 @@ def _build_instructions(wb):
              'Mixed-Integer Linear Program solved with PuLP/CBC. All years are '
              'optimised simultaneously — avoids the myopic decisions of the legacy '
              'greedy solver (38 sets → target ≤ 28 sets).'),
-            ('Priority',
-             '1. Minimise lines open  ·  2. Minimise tooling sets  ·  '
-             '3. Minimise product-line switches year-over-year.'),
+            ('Objective',
+             'Minimise total cost: line capital + upgrade/validation costs for '
+             'late product introductions + mechanical and optical tooling sets. '
+             'All cost inputs are configurable in the Parameters sheet.'),
         ]),
         (9, 'INPUT SHEETS  (edit yellow cells)', [
             ('Demand',
@@ -247,8 +255,9 @@ def _build_instructions(wb):
              'future products; set to zero until needed.'),
             ('Parameters',
              'Production setup (hours/shift, shifts, days, weeks), cycle times '
-             '(seconds/unit, default 12 s), and base OEE per line (default 0.85). '
-             'Changeover OEE penalty is applied by the solver in code.'),
+             '(seconds/unit, default 12 s), base OEE per line (default 0.85), '
+             'and cost inputs: line cost ($3.5M), upgrade cost ($500K), '
+             'mech tooling ($110K), optical tooling ($220K), validation ($100K).'),
             ('Tooling',
              'Compatibility matrices (10×10, mech + optical). Set to 1 when two '
              'products share one physical set on a line; 0 = separate sets. '
@@ -429,6 +438,32 @@ def _build_parameters(wb, data):
         for p in range(10):
             _w(ws, row, 2 + p, oee[l][p], bg=C_INPUT, h='center', fmt='0.00')
         ws.row_dimensions[row].height = 16
+
+    ws.row_dimensions[PAR_OEE_DATA_ROW + 15].height = 8
+
+    # ── Cost Parameters ────────────────────────────────────────────────────────
+    _sect(ws, PAR_COST_HDR_ROW, '  COST PARAMETERS  (USD)', ncols=3)
+    cost_rows = [
+        (PAR_COST_LINE_ROW, 'Cost of new production line',           3_500_000, '$#,##0', 'USD / line'),
+        (PAR_COST_UPGR_ROW, 'Cost of line upgrade (new product)',       500_000, '$#,##0', 'USD / upgrade'),
+        (PAR_COST_MECH_ROW, 'Mechanical tooling set cost',              110_000, '$#,##0', 'USD / set'),
+        (PAR_COST_OPT_ROW,  'Optical tooling set cost',                 220_000, '$#,##0', 'USD / set'),
+        (PAR_COST_VALD_ROW, 'Validation cost (late product intro)',      100_000, '$#,##0', 'USD / event'),
+    ]
+    for cost_row, label, val, fmt, unit in cost_rows:
+        ws.cell(row=cost_row, column=1).value     = label
+        ws.cell(row=cost_row, column=1).font      = _font(size=10)
+        ws.cell(row=cost_row, column=1).fill      = _fill(C_RONLY)
+        ws.cell(row=cost_row, column=1).border    = _border_thin()
+        ws.cell(row=cost_row, column=1).alignment = _al()
+        _w(ws, cost_row, 2, val, bold=True, bg=C_INPUT, h='right', fmt=fmt)
+        ws.cell(row=cost_row, column=3).value     = unit
+        ws.cell(row=cost_row, column=3).font      = _font(size=9, color='808080')
+        ws.row_dimensions[cost_row].height        = 18
+    _note(ws, PAR_COST_VALD_ROW + 1,
+          'Validation cost is triggered once per product per line when that product '
+          "is introduced to a line after the line's initial commissioning year.",
+          ncols=3)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

@@ -51,6 +51,11 @@ PAR_WEEKS_ROW    = 7
 PAR_VAL_COL      = 2
 PAR_CT_DATA_ROW  = 14   # first cycle-time data row (Line 1); col 2=P1 … col 11=P10
 PAR_OEE_DATA_ROW = 33   # first OEE data row (Line 1)
+PAR_COST_LINE_ROW = 50  # cost of a new production line
+PAR_COST_UPGR_ROW = 51  # cost of upgrading an established line with a new product
+PAR_COST_MECH_ROW = 52  # cost per mechanical tooling set
+PAR_COST_OPT_ROW  = 53  # cost per optical tooling set
+PAR_COST_VALD_ROW = 54  # validation cost per late product introduction
 
 # 'Tooling' sheet positions
 TOOLING_MECH_ROW = 7    # first mech matrix data row (P1); col 2=P1 … col 11=P10
@@ -63,10 +68,14 @@ ALLOC_DATA_ROW = 6
 # ── Solver configuration (edit these to change behaviour) ─────────────────────
 BASE_OEE               = 0.85   # OEE for single-product lines (default)
 CHANGEOVER_OEE_PENALTY = 0.03   # OEE reduction for lines running 2+ products
-W_LINES                = 10_000 # objective weight: minimise open lines
-W_TOOLING              = 100    # objective weight: minimise tooling sets
-W_SWITCHES             = 1      # objective weight: minimise product-line changes
 SOLVER_TIME_LIMIT      = 300    # CBC wall-clock limit in seconds
+
+# Default costs (USD) — overridden by values in the Parameters sheet
+DEFAULT_COST_LINE       = 3_500_000   # one-time capital per new line opened
+DEFAULT_COST_UPGRADE    =   500_000   # hardware upgrade per product added to established line
+DEFAULT_COST_MECH       =   110_000   # per mechanical tooling set purchased
+DEFAULT_COST_OPT        =   220_000   # per optical tooling set purchased
+DEFAULT_COST_VALIDATION =   100_000   # process validation per late product intro on a line
 
 # ── Product colours for Gantt chart ───────────────────────────────────────────
 PRODUCT_COLORS = [
@@ -117,8 +126,21 @@ def load_inputs(wb):
     ot  = [[ws_t.cell(row=TOOLING_OPT_ROW  + i, column=2 + j).value or 0
             for j in range(10)] for i in range(10)]
 
+    # Cost parameters (fall back to defaults if cells are empty)
+    def _cost(row, default):
+        v = ws_p.cell(row=row, column=PAR_VAL_COL).value
+        return float(v) if v is not None else default
+
+    costs = {
+        'line':       _cost(PAR_COST_LINE_ROW, DEFAULT_COST_LINE),
+        'upgrade':    _cost(PAR_COST_UPGR_ROW, DEFAULT_COST_UPGRADE),
+        'mech':       _cost(PAR_COST_MECH_ROW, DEFAULT_COST_MECH),
+        'opt':        _cost(PAR_COST_OPT_ROW,  DEFAULT_COST_OPT),
+        'validation': _cost(PAR_COST_VALD_ROW, DEFAULT_COST_VALIDATION),
+    }
+
     return {'years': years, 'demand': demand, 'avail': avail,
-            'ct': ct, 'oee': oee, 'mt': mt, 'ot': ot}
+            'ct': ct, 'oee': oee, 'mt': mt, 'ot': ot, 'costs': costs}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -238,20 +260,31 @@ def build_and_solve(inp):
         [(f, l) for f in range(OF) for l in range(L)],
         cat='Binary')
 
-    # chg[p,l,i]  binary: 1 if u[p,l,i] changed from u[p,l,i-1]  (i >= 1)
-    chg = pulp.LpVariable.dicts(
-        'chg',
-        [(p, l, i) for p in range(P) for l in range(L) for i in range(1, Y)],
+    # ever_open[l]  binary: 1 if line l is opened at any point (one-time capital)
+    ever_open = pulp.LpVariable.dicts(
+        'ever_open',
+        [l for l in range(L)],
         cat='Binary')
 
-    # ── Objective ─────────────────────────────────────────────────────────────
+    # late_intro[p,l]  binary: 1 if product p is introduced to line l after
+    # the line's initial commissioning year (triggers upgrade + validation cost)
+    late_intro = pulp.LpVariable.dicts(
+        'late_intro',
+        [(p, l) for p in range(P) for l in range(L)],
+        cat='Binary')
+
+    costs = inp['costs']
+
+    # ── Objective  (minimise total USD cost) ──────────────────────────────────
     prob += (
-        W_LINES   * pulp.lpSum(o[l, i]    for l in range(L) for i in range(Y))
-      + W_TOOLING * pulp.lpSum(tm[f, l]   for f in range(MF) for l in range(L))
-      + W_TOOLING * pulp.lpSum(to_[f, l]  for f in range(OF) for l in range(L))
-      + W_SWITCHES * pulp.lpSum(chg[p, l, i]
-                                for p in range(P) for l in range(L)
-                                for i in range(1, Y))
+        costs['line']       * pulp.lpSum(ever_open[l] for l in range(L))
+      + (costs['upgrade'] + costs['validation'])
+                            * pulp.lpSum(late_intro[p, l]
+                                         for p in range(P) for l in range(L))
+      + costs['mech']      * pulp.lpSum(tm[f, l]
+                                         for f in range(MF) for l in range(L))
+      + costs['opt']       * pulp.lpSum(to_[f, l]
+                                         for f in range(OF) for l in range(L))
     )
 
     # ── Constraints ───────────────────────────────────────────────────────────
@@ -317,14 +350,21 @@ def build_and_solve(inp):
                 for i in range(Y):
                     prob += (to_[f, l] >= u[p, l, i], f'to_{f}_{l}_{p}_{i}')
 
-    # 9. Switch detection: chg = 1 when u[p,l,i] differs from u[p,l,i-1]
+    # 9. ever_open: line counts as opened once any year-slot is active
+    for l in range(L):
+        for i in range(Y):
+            prob += (ever_open[l] >= o[l, i], f'ever_open_{l}_{i}')
+
+    # 10. late_intro: fires when product p arrives on line l after the line
+    #     was already open (u goes 0→1 while line was open in prior year).
+    #     Constraint: late_intro[p,l] >= u[p,l,i] - u[p,l,i-1] + o[l,i-1] - 1
+    #     RHS = 1 only when product newly assigned AND line already existed.
     for p in range(P):
         for l in range(L):
             for i in range(1, Y):
-                prob += (chg[p, l, i] >= u[p, l, i] - u[p, l, i - 1],
-                         f'chgA_{p}_{l}_{i}')
-                prob += (chg[p, l, i] >= u[p, l, i - 1] - u[p, l, i],
-                         f'chgB_{p}_{l}_{i}')
+                prob += (late_intro[p, l]
+                         >= u[p, l, i] - u[p, l, i - 1] + o[l, i - 1] - 1,
+                         f'late_intro_{p}_{l}_{i}')
 
     # ── Solve ─────────────────────────────────────────────────────────────────
     n_vars  = len(prob.variables())
@@ -367,8 +407,18 @@ def build_and_solve(inp):
         1 for f in range(OF) for l in range(L)
         if pulp.value(to_[f, l]) is not None and pulp.value(to_[f, l]) > 0.5
     )
+    n_lines_opened = sum(
+        1 for l in range(L)
+        if pulp.value(ever_open[l]) is not None and pulp.value(ever_open[l]) > 0.5
+    )
+    n_late_intros = sum(
+        1 for p in range(P) for l in range(L)
+        if pulp.value(late_intro[p, l]) is not None and pulp.value(late_intro[p, l]) > 0.5
+    )
 
-    return alloc, tooled, intro, mech_sets, opt_sets, mech_fams, opt_fams
+    return (alloc, tooled, intro,
+            mech_sets, opt_sets, mech_fams, opt_fams,
+            n_lines_opened, n_late_intros)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -654,7 +704,8 @@ def plot_gantt(alloc, inp, intro, out_path):
 # REPORT SHEET
 # ─────────────────────────────────────────────────────────────────────────────
 def write_report_sheet(wb, alloc, tooled, intro, mech_fams, opt_fams,
-                       mech_sets, opt_sets, inp, ok):
+                       mech_sets, opt_sets, n_lines_opened, n_late_intros,
+                       inp, ok):
     """Write lines summary, tooling ID registry, and demand validation."""
     import datetime
     ws     = wb[REPORT_SHEET]
@@ -701,22 +752,64 @@ def write_report_sheet(wb, alloc, tooled, intro, mech_fams, opt_fams,
             c.alignment = _ral('right' if isinstance(v, (int, float)) else 'left')
         ws.row_dimensions[row].height = 15
 
+    costs = inp['costs']
+    total_cost = (
+        costs['line']       * n_lines_opened
+      + (costs['upgrade'] + costs['validation']) * n_late_intros
+      + costs['mech']      * mech_sets
+      + costs['opt']       * opt_sets
+    )
+
     ts = datetime.datetime.now().strftime('%Y-%m-%d  %H:%M')
     ws.cell(row=2, column=1).value = (
         f'Last run: {ts}   |   '
         f'{"✓  All OK" if ok else "⚠  Issues found"}   |   '
-        f'{mech_sets} mech + {opt_sets} opt = {mech_sets + opt_sets} sets total'
+        f'{mech_sets} mech + {opt_sets} opt = {mech_sets + opt_sets} sets   |   '
+        f'Total cost: ${total_cost:,.0f}'
     )
     ws.cell(row=2, column=1).font = Font(name='Calibri', italic=True,
                                          size=10, color='595959')
     ws.merge_cells('A2:G2')
     ws.row_dimensions[3].height = 6
 
+    # ── Cost breakdown ────────────────────────────────────────────────────────
+    _sect_r(4, '  COST BREAKDOWN')
+    _hdr_r(5, ['Cost item', 'Unit cost (USD)', 'Qty', 'Total (USD)'])
+    cost_items = [
+        ('New production lines',        costs['line'],       n_lines_opened,
+         costs['line'] * n_lines_opened),
+        ('Line upgrades (new products)', costs['upgrade'],   n_late_intros,
+         costs['upgrade'] * n_late_intros),
+        ('Validation events',            costs['validation'], n_late_intros,
+         costs['validation'] * n_late_intros),
+        ('Mechanical tooling sets',      costs['mech'],      mech_sets,
+         costs['mech'] * mech_sets),
+        ('Optical tooling sets',         costs['opt'],       opt_sets,
+         costs['opt'] * opt_sets),
+    ]
+    for ci, (label, unit_cost, qty, subtotal) in enumerate(cost_items):
+        bg = 'F0F8F0' if ci % 2 else 'E2EFDA'
+        _data_r(6 + ci, [label, unit_cost, qty, subtotal], bg=bg)
+    # Total row
+    total_row = 6 + len(cost_items)
+    _data_r(total_row,
+            ['TOTAL', '', '', total_cost],
+            bg='BDD7EE')
+    ws.cell(row=total_row, column=1).font = _rfont(bold=True, sz=10)
+    ws.cell(row=total_row, column=4).font = _rfont(bold=True, sz=10)
+    for col in [2, 4]:
+        ws.cell(row=total_row - 5, column=col).number_format = '$#,##0'
+    for ci in range(len(cost_items)):
+        for col in [2, 4]:
+            ws.cell(row=6 + ci, column=col).number_format = '$#,##0'
+    ws.cell(row=total_row, column=4).number_format = '$#,##0'
+
+    r = total_row + 2  # spacer before next section
+
     # ── Lines summary ─────────────────────────────────────────────────────────
-    _sect_r(4, '  LINES SUMMARY')
-    _hdr_r(5, ['Line', 'Intro', 'Products', 'Tooling sets', 'Eff. OEE %',
-               'Peak util %', 'Peak year'])
-    r = 6
+    _sect_r(r, '  LINES SUMMARY'); r += 1
+    _hdr_r(r, ['Line', 'Intro', 'Products', 'Tooling sets', 'Eff. OEE %',
+               'Peak util %', 'Peak year']); r += 1
     for l in sorted(intro.keys()):
         ps     = sorted(f'P{p+1}' for p in tooled[l])
         n_prod = len(ps)
@@ -846,6 +939,10 @@ def main():
           f'  (sizes: {sorted(len(f) for f in mf_preview)})')
     print(f'  Opt  tooling families  : {len(of_preview)}'
           f'  (sizes: {sorted(len(f) for f in of_preview)})')
+    c = inp['costs']
+    print(f'  Cost — line: ${c["line"]:,.0f}  upgrade: ${c["upgrade"]:,.0f}  '
+          f'mech: ${c["mech"]:,.0f}  opt: ${c["opt"]:,.0f}  '
+          f'validation: ${c["validation"]:,.0f}')
 
     print('\nBuilding & solving ILP ...')
     result = build_and_solve(inp)
@@ -853,7 +950,8 @@ def main():
         print('Solver failed — no solution found.')
         sys.exit(1)
 
-    alloc, tooled, intro, mech_sets, opt_sets, mech_fams, opt_fams = result
+    alloc, tooled, intro, mech_sets, opt_sets, mech_fams, opt_fams, \
+        n_lines_opened, n_late_intros = result
 
     print('\nVerifying solution ...')
     ok = verify(alloc, inp)
@@ -862,6 +960,20 @@ def main():
     total_sets = mech_sets + opt_sets
     print(f'\nTooling: {mech_sets} mech + {opt_sets} opt = {total_sets} sets')
     print(f'  (greedy baseline: 19+19=38  |  theory min: 14+14=28)')
+
+    costs = inp['costs']
+    cost_lines  = costs['line']       * n_lines_opened
+    cost_late   = (costs['upgrade'] + costs['validation']) * n_late_intros
+    cost_mech   = costs['mech']      * mech_sets
+    cost_opt    = costs['opt']       * opt_sets
+    total_cost  = cost_lines + cost_late + cost_mech + cost_opt
+    print(f'\nCost breakdown:')
+    print(f'  Lines opened      : {n_lines_opened}  × ${costs["line"]:,.0f}  = ${cost_lines:,.0f}')
+    print(f'  Late intros       : {n_late_intros}  × ${costs["upgrade"]+costs["validation"]:,.0f}  = ${cost_late:,.0f}')
+    print(f'  Mech tooling sets : {mech_sets}  × ${costs["mech"]:,.0f}  = ${cost_mech:,.0f}')
+    print(f'  Opt  tooling sets : {opt_sets}  × ${costs["opt"]:,.0f}  = ${cost_opt:,.0f}')
+    print(f'  ─────────────────────────────────────────────────')
+    print(f'  TOTAL             :                    ${total_cost:,.0f}')
 
     print('\nLines used:')
     for l in sorted(intro.keys()):
@@ -888,7 +1000,8 @@ def main():
     print(f'  Allocation sheet: {n_rows} rows written')
 
     write_report_sheet(wb, alloc, tooled, intro, mech_fams, opt_fams,
-                       mech_sets, opt_sets, inp, ok)
+                       mech_sets, opt_sets, n_lines_opened, n_late_intros,
+                       inp, ok)
     print('  Report sheet: written')
 
     tooling_records = compute_tooling_ids(
