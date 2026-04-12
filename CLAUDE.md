@@ -7,6 +7,18 @@ on shared lines. Optimizes: (1) how many lines per year, (2) which products on w
 (3) volume per line, (4) total tooling investment (mechanical + optical sets).
 Goal: minimize tooling while meeting demand and respecting time-based capacity constraints.
 
+## Current Status
+
+The project has two solvers:
+
+| Solver | Algorithm | Tooling sets | Notes |
+|--------|-----------|-------------|-------|
+| `solver_greedy.py` | Greedy heuristic (year-by-year) | 38 sets | Original; preserved as reference |
+| `solver_ilp.py` | Mixed-Integer Linear Program (CBC) | Target: ~28 sets | **Active solver** |
+
+The ILP solver is the primary tool going forward. It closes the 10-set gap over the greedy
+approach by optimising all years simultaneously and exploiting tooling-sharing matrices.
+
 ## Inputs (Blad1 sheet)
 
 - Volume Demand: A1, rows 3-19, cols B-L (years 2025-2041, 10 products)
@@ -103,32 +115,99 @@ across lines, requiring more tooling sets per line.
 
 ```
 LineToolingOptimization/
-├── Book.xlsx           — Excel workbook with all input data, output grid, and summary
-├── solver.py           — Python optimizer (greedy heuristic, reads/writes Book.xlsx)
-└── CLAUDE.md           — This file (project documentation and algorithm reference)
+├── Book.xlsx             — Excel workbook: all inputs, output grid, validation, summary
+├── solver_ilp.py         — ILP solver (primary) — reads Book.xlsx, writes 3 outputs
+├── solver_greedy.py      — Original greedy solver (reference / fallback)
+├── solver.py             — Alias kept for compatibility (same as solver_greedy.py)
+├── requirements.txt      — Python dependencies: pulp, matplotlib, openpyxl
+└── CLAUDE.md             — This file
 ```
 
-## How to Re-run
+Generated outputs (written to the same directory as the workbook):
 
-1. Modify demand/cycle times/OEE/tooling on Blad1
-2. Run: `python solver.py Book.xlsx`
-3. Check validation rows 119-135 on Blad1 (all should show OK)
-4. Review Summary sheet for updated line count, utilization, tooling
+```
+tooling_summary.csv   — Allocation per line/year + physical tooling ID table
+line_gantt.png        — Gantt chart: products per line across all years
+Book.xlsx             — Updated with allocation grid (Blad1 rows 98+)
+```
+
+## How to Run (ILP Solver)
+
+```bash
+# 1. Install dependencies (once)
+pip install -r requirements.txt
+
+# 2. Run the ILP solver
+python solver_ilp.py Book.xlsx
+
+# 3. Check console output for tooling count and per-year summary
+# 4. Open tooling_summary.csv for detailed line/year allocation + tooling IDs
+# 5. Open line_gantt.png for visual overview
+# 6. Open Book.xlsx → Blad1 validation rows 119-135 (all should show OK)
+```
+
+## ILP Solver — Key Features
+
+### Optimisation Objective (priority order)
+1. **Minimise total lines** open across all years (`W_LINES = 10,000`)
+2. **Minimise tooling sets** — one set per tooling *family* per line, not per product (`W_TOOLING = 100`)
+3. **Minimise product-line switches** — penalises moving a product to a different line year-over-year (`W_SWITCHES = 1`)
+
+### Tooling Sharing
+Reads the 10×10 mechanical and optical compatibility matrices from Blad1. Computes connected
+components (union-find) — products in the same family share one physical set on a line.
+
+- Current matrices are **identity** (no sharing) — each product = its own family
+- To enable sharing: set `mech_matrix[i][j] = mech_matrix[j][i] = 1` for compatible product pairs
+- The tooling count drops automatically; no solver changes needed
+
+### Changeover OEE Penalty
+Lines running 2+ products incur a flat OEE reduction (configurable):
+
+```python
+BASE_OEE               = 0.85   # single-product line OEE
+CHANGEOVER_OEE_PENALTY = 0.03   # reduction for multi-product lines → effective 82%
+```
+
+Evaluated per line per year. A line that consolidates to a single product reverts to BASE_OEE.
+Implemented as a linear constraint: `sum(x*ct) + avail*PENALTY*multi <= avail*BASE_OEE`.
+
+### Physical Tooling ID Tracking
+Each tooling set is named by product family and type:
+- `MECH-P01` — mechanical set for the family containing P1
+- `OPTI-P02` — optical set for the family containing P2
+
+The `tooling_summary.csv` shows which line each ID sits on and the years it is active,
+making it easy to track tooling movement between lines across years.
+
+## Configurable Parameters (top of solver_ilp.py)
+
+| Parameter | Default | Effect |
+|-----------|---------|--------|
+| `BASE_OEE` | 0.85 | OEE for single-product lines |
+| `CHANGEOVER_OEE_PENALTY` | 0.03 | OEE reduction for multi-product lines |
+| `W_LINES` | 10,000 | Objective weight: minimise open lines |
+| `W_TOOLING` | 100 | Objective weight: minimise tooling sets |
+| `W_SWITCHES` | 1 | Objective weight: minimise product-line changes |
+| `SOLVER_TIME_LIMIT` | 300 | CBC solver wall-clock limit (seconds) |
+| `NUM_LINES` | 15 | Maximum lines available |
+| `NUM_PRODUCTS` | 10 | Maximum products supported |
 
 ## What Could Change
 
-- New products P5-P10: just add demand data, solver handles up to 10
-- Different cycle times per product/line: update the matrix rows 31-45
-- Tooling sharing: change identity matrices to reflect product families
-- More/fewer lines: change `NUM_LINES` in solver.py (currently 15)
-- Different look-ahead: change `LOOK_AHEAD_YEARS` (currently 3)
+- **New products P5-P10**: add demand rows to Blad1; solver handles up to 10 automatically
+- **Different cycle times**: update rows 31-45 in Blad1
+- **Tooling sharing**: update the 10×10 matrices in Blad1 (rows 70-79 mech, 84-93 optical)
+- **More/fewer lines**: change `NUM_LINES` in solver_ilp.py
+- **Tighter time budget**: reduce `SOLVER_TIME_LIMIT` for faster (possibly suboptimal) results
 
 ## Known Limitations
 
-- Greedy heuristic, not global optimizer (early year decisions affect later)
-- Tooling sharing matrices read but not fully exploited in scoring yet
-- No changeover time modeling between products on same line
-- No multi-year demand smoothing; each year is solved independently
+- ILP may hit the time limit on large instances; increase `SOLVER_TIME_LIMIT` if needed
+- No multi-year demand smoothing; each year is an independent constraint block
+- No minimum lot size or campaign-length constraints
+- No changeover *time* (only OEE penalty); add a changeover matrix if needed later
+- Tooling movement between lines has no cost penalty currently
 
 ## Demand Summary (2025-2041, active products P1-P4 only)
 
