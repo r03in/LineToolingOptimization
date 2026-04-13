@@ -123,6 +123,7 @@ def load_inputs(wb):
     }
 
     return {'years': years, 'demand': demand, 'avail': avail,
+            'days': setup['days'],
             'ct': ct, 'oee': oee, 'costs': costs}
 
 
@@ -335,6 +336,253 @@ def _oborder():
 
 def _oal(h='center', v='center'):
     return Alignment(horizontal=h, vertical=v)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7-DAY WORKING CHECK  (written below the main allocation grid)
+# ─────────────────────────────────────────────────────────────────────────────
+def _write_7day_check(ws, alloc, intro, inp, used_lines, years, row_start):
+    """
+    Writes a what-if section: 'If we had not opened the last line, how many of
+    the remaining lines would need to work 7 days/week to cover the demand?'
+
+    Red cells = line must extend to 7-day working.
+    Returns next free row number.
+    """
+    P       = NUM_PRODUCTS
+    avail_6 = inp['avail']
+    days_6  = inp['days']
+    avail_7 = avail_6 / days_6 * 7
+    ct      = inp['ct']
+    demand  = inp['demand']
+
+    if len(intro) < 2:
+        return row_start
+
+    last_line  = max(intro, key=lambda l: (intro[l], l))
+    last_intro = intro[last_line]
+    n1_lines   = [l for l in used_lines if l != last_line]
+    N1         = len(n1_lines)
+
+    years_check = [yr for yr in years if yr >= last_intro]
+    if not years_check:
+        return row_start
+
+    # ── Per-year analysis ──────────────────────────────────────────────────────
+    year_meta   = {}
+    any_unavoid = False
+
+    for yr in years_check:
+        d       = demand[yr]
+        tot_dem = sum(d)
+
+        shortfall_sec = sum(
+            alloc.get((yr, last_line, p), 0) * ct[last_line][p]
+            for p in range(P)
+        )
+
+        line_extra = {}
+        for l in n1_lines:
+            units_l = [alloc.get((yr, l, p), 0) for p in range(P)]
+            n_prod  = sum(1 for p in range(P) if units_l[p] > 0)
+            oee_eff = BASE_OEE - (CHANGEOVER_OEE_PENALTY if n_prod > 1 else 0)
+            line_extra[l] = (avail_7 - avail_6) * oee_eff
+
+        total_extra = sum(line_extra.values())
+        unavoidable = shortfall_sec > 0 and total_extra < shortfall_sec
+
+        if unavoidable:
+            any_unavoid = True
+            lines_7day  = set(n1_lines)
+        elif shortfall_sec <= 0:
+            lines_7day = set()
+        else:
+            sorted_l   = sorted(n1_lines, key=lambda l: line_extra[l], reverse=True)
+            lines_7day = set()
+            covered    = 0.0
+            for l in sorted_l:
+                if covered >= shortfall_sec:
+                    break
+                lines_7day.add(l)
+                covered += line_extra[l]
+
+        tot_cap = 0
+        for l in n1_lines:
+            units_l = [alloc.get((yr, l, p), 0) for p in range(P)]
+            n_prod  = sum(1 for p in range(P) if units_l[p] > 0)
+            oee_eff = BASE_OEE - (CHANGEOVER_OEE_PENALTY if n_prod > 1 else 0)
+            av      = avail_7 if l in lines_7day else avail_6
+            tot_ct  = sum(ct[l][p] * d[p] for p in range(P))
+            avg_ct  = (tot_ct / tot_dem) if tot_dem > 0 else 12
+            tot_cap += av * oee_eff / avg_ct
+
+        year_meta[yr] = {
+            'lines_7day':  lines_7day,
+            'unavoidable': unavoidable,
+            'tot_cap':     tot_cap,
+        }
+
+    # ── Write to sheet ────────────────────────────────────────────────────────
+    C_RED    = 'FFC7CE'
+    C_RED_FT = '9C0006'
+    bdr      = _oborder()
+    row      = row_start + 2
+
+    # Banner
+    ws.cell(row=row, column=1).value = (
+        f'7-DAY WORKING CHECK  —  Alternative to opening L{last_line + 1}'
+    )
+    ws.cell(row=row, column=1).font      = Font(name='Calibri', bold=True,
+                                                size=12, color=C_WHITE)
+    ws.cell(row=row, column=1).fill      = PatternFill('solid', fgColor=C_TITLE)
+    ws.cell(row=row, column=1).alignment = Alignment(horizontal='center',
+                                                      vertical='center')
+    ws.merge_cells(start_row=row, start_column=1, end_row=row,
+                   end_column=max(N1 + 5, 8))
+    ws.row_dimensions[row].height = 24
+    row += 1
+
+    ws.cell(row=row, column=1).value = (
+        f'From {last_intro} onward: could the {N1} existing line(s) have '
+        f'avoided L{last_line + 1} by working 7 days/week?  '
+        f'(current schedule: {int(days_6)} days/week)'
+    )
+    ws.cell(row=row, column=1).font = Font(name='Calibri', italic=True,
+                                            size=9, color='595959')
+    ws.merge_cells(start_row=row, start_column=1, end_row=row,
+                   end_column=max(N1 + 5, 8))
+    ws.row_dimensions[row].height = 14
+    row += 1
+    ws.row_dimensions[row].height = 6
+    row += 1
+
+    extra_start = 2 + N1
+    ws.column_dimensions['A'].width = 8
+    for idx in range(N1):
+        ws.column_dimensions[get_column_letter(2 + idx)].width = 14
+    for i, w in enumerate([12, 14, 14, 10]):
+        ws.column_dimensions[get_column_letter(extra_start + i)].width = w
+
+    def _h(r, c, val):
+        cell = ws.cell(row=r, column=c)
+        cell.value     = val
+        cell.font      = Font(name='Calibri', bold=True, size=10)
+        cell.fill      = PatternFill('solid', fgColor=C_COLHDR)
+        cell.border    = bdr
+        cell.alignment = Alignment(horizontal='center', vertical='center',
+                                   wrap_text=True)
+
+    ws.row_dimensions[row].height = 28
+    _h(row, 1, 'Year')
+    for idx, l in enumerate(n1_lines):
+        _h(row, 2 + idx, f'L{l + 1}')
+    _h(row, extra_start,     'Lines\nat 7-day')
+    _h(row, extra_start + 1, 'Total\nDemand')
+    _h(row, extra_start + 2, 'Capacity\n(scenario)')
+    _h(row, extra_start + 3, 'Util %')
+    row += 1
+
+    for yr in years_check:
+        meta     = year_meta[yr]
+        lines7   = meta['lines_7day']
+        unavoid  = meta['unavoidable']
+        d        = demand[yr]
+        tot_dem  = sum(d)
+        tot_cap  = meta['tot_cap']
+        util_pct = (tot_dem / tot_cap * 100) if tot_cap > 0 else 0
+
+        ws.row_dimensions[row].height = 18
+
+        yc = ws.cell(row=row, column=1)
+        yc.value     = yr
+        yc.font      = Font(name='Calibri', bold=True, size=10)
+        yc.fill      = PatternFill('solid', fgColor=C_RED if unavoid else C_RONLY)
+        yc.border    = bdr
+        yc.alignment = Alignment(horizontal='center', vertical='center')
+
+        for idx, l in enumerate(n1_lines):
+            col  = 2 + idx
+            cell = ws.cell(row=row, column=col)
+            cell.border = bdr
+            prods = [p for p in range(P) if alloc.get((yr, l, p), 0) > 0]
+            at_7  = l in lines7
+
+            if not prods:
+                cell.fill      = PatternFill('solid', fgColor=C_RED if at_7 else 'F2F2F2')
+                cell.value     = '7d —' if at_7 else '—'
+                cell.font      = Font(name='Calibri', size=9, italic=True,
+                                      bold=at_7,
+                                      color=C_RED_FT if at_7 else 'AAAAAA')
+                cell.alignment = Alignment(horizontal='center', vertical='center')
+            else:
+                label = ', '.join(f'P{p+1}' for p in prods)
+                multi = len(prods) > 1
+                bg    = C_RED if at_7 else (C_AMBER if multi else C_GREEN)
+                color = C_RED_FT if at_7 else '1F1F1F'
+                cell.fill      = PatternFill('solid', fgColor=bg)
+                cell.value     = ('7d  ' if at_7 else '') + label
+                cell.font      = Font(name='Calibri', size=9, bold=True, color=color)
+                cell.alignment = Alignment(horizontal='center', vertical='center',
+                                           wrap_text=True)
+
+        sum_bg = C_RED if unavoid else C_RONLY
+        sum_ft = C_RED_FT if unavoid else '1F1F1F'
+
+        def _sc(col, val, fmt=None):
+            c = ws.cell(row=row, column=col)
+            c.value     = val
+            c.font      = Font(name='Calibri', size=10, color=sum_ft)
+            c.fill      = PatternFill('solid', fgColor=sum_bg)
+            c.border    = bdr
+            c.alignment = Alignment(horizontal='right', vertical='center')
+            if fmt and isinstance(val, (int, float)):
+                c.number_format = fmt
+
+        n7_label = '⚠ NOT ENOUGH' if unavoid else len(lines7)
+        _sc(extra_start,     n7_label)
+        _sc(extra_start + 1, tot_dem,            '#,##0')
+        _sc(extra_start + 2, int(tot_cap),       '#,##0')
+        _sc(extra_start + 3, round(util_pct, 1), '0.0"%"')
+        row += 1
+
+    # Legend
+    row += 1
+    for bg, label in [
+        (C_RED,   'Line must work 7 days/week to absorb demand from removed line'),
+        (C_GREEN, 'Line at normal 6 days/week — single product'),
+        (C_AMBER, 'Line at normal 6 days/week — multi product'),
+    ]:
+        c = ws.cell(row=row, column=2)
+        c.fill   = PatternFill('solid', fgColor=bg)
+        c.value  = ''
+        c.border = bdr
+        c2 = ws.cell(row=row, column=3)
+        c2.value = label
+        c2.font  = Font(name='Calibri', italic=True, size=9, color='595959')
+        ws.row_dimensions[row].height = 14
+        row += 1
+
+    if any_unavoid:
+        row += 1
+        bad_yrs = ', '.join(str(yr) for yr in years_check
+                            if year_meta[yr]['unavoidable'])
+        note = (
+            f'\u26a0  NOTE: Even with all {N1} existing line(s) at 7 days/week, '
+            f'demand in {bad_yrs} exceeds their total capacity. '
+            f'Opening L{last_line + 1} (or equivalent) is unavoidable.'
+        )
+        c = ws.cell(row=row, column=1)
+        c.value     = note
+        c.font      = Font(name='Calibri', bold=True, size=10, color=C_RED_FT)
+        c.fill      = PatternFill('solid', fgColor='FFE7E7')
+        c.alignment = Alignment(horizontal='left', vertical='center',
+                                wrap_text=True)
+        ws.merge_cells(start_row=row, start_column=1, end_row=row,
+                       end_column=max(N1 + 5, 8))
+        ws.row_dimensions[row].height = 30
+        row += 1
+
+    return row
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -580,6 +828,9 @@ def write_output(wb, alloc, intro, inp, n_line_years, n_mixed_years, ok):
         c.alignment      = Alignment(horizontal='right')
         ws.row_dimensions[row].height = 16
         row += 1
+
+    # ── 7-day working check ────────────────────────────────────────────────────
+    row = _write_7day_check(ws, alloc, intro, inp, used_lines, years, row)
 
     return row - ALLOC_DATA_ROW  # rows written
 
