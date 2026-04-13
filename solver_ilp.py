@@ -569,110 +569,285 @@ def compute_tooling_ids(alloc, tooled, intro, mech_fams, opt_fams, years):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# EXCEL OUTPUT  (formatted table written to Allocation sheet)
+# EXCEL OUTPUT  (formatted grid written to Allocation sheet)
 # ─────────────────────────────────────────────────────────────────────────────
+import datetime as _dt
+from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+from openpyxl.cell import MergedCell as _MergedCell
+
+# Colour palette
+_C_TITLE  = '1F3864'
+_C_SECT   = '2E75B6'
+_C_COLHDR = 'BDD7EE'
+_C_RONLY  = 'F2F2F2'
+_C_GREEN  = 'E2EFDA'   # single-product line cell
+_C_AMBER  = 'FFE699'   # mixed-product line cell
+_C_WHITE  = 'FFFFFF'
+_C_BORDER = 'B8CCE4'
+
 def _ofill(hex_color):
-    from openpyxl.styles import PatternFill
     return PatternFill('solid', fgColor=hex_color)
 
 def _ofont(bold=False, size=10, color='1F1F1F'):
-    from openpyxl.styles import Font
     return Font(name='Calibri', bold=bold, size=size, color=color)
 
 def _oborder():
-    from openpyxl.styles import Border, Side
-    t = Side(style='thin', color='B8CCE4')
+    t = Side(style='thin', color=_C_BORDER)
     return Border(left=t, right=t, top=t, bottom=t)
 
 def _oal(h='left'):
-    from openpyxl.styles import Alignment
     return Alignment(horizontal=h, vertical='center')
 
 
-def write_output(wb, alloc, tooled, intro, inp, mech_sets, opt_sets, ok):
-    """Write formatted allocation table to the Allocation sheet in wb."""
-    import datetime
+def write_output(wb, alloc, tooled, intro, inp, mech_sets, opt_sets,
+                 n_line_years, n_late_intros, ok):
+    """Write grid-format allocation table to the Allocation sheet in wb."""
     ws     = wb[ALLOC_SHEET]
-    years  = inp['years']
-    demand = inp['demand']
-    ct     = inp['ct']
     avail  = inp['avail']
+    ct     = inp['ct']
+    demand = inp['demand']
+    costs  = inp['costs']
 
-    # Clear old data rows (rows ALLOC_DATA_ROW onward).
-    # Unmerge any merged regions that overlap this range first, then clear.
-    from openpyxl.cell import MergedCell
-    clear_start = ALLOC_DATA_ROW
-    clear_end   = ALLOC_DATA_ROW + 500
+    # Active demand years only
+    years = [yr for yr in inp['years'] if sum(demand[yr]) > 0]
+
+    # Which lines were ever used?
+    used_lines = sorted(intro.keys())
+    N = len(used_lines)
+
+    bdr = _oborder()
+
+    # ── Clear everything from row 1 (handles merged title/header cells) ────────
+    clear_start = 1
+    clear_end   = ALLOC_DATA_ROW + 300
     for rng in list(ws.merged_cells.ranges):
         if rng.min_row <= clear_end and rng.max_row >= clear_start:
             ws.unmerge_cells(str(rng))
     for r in range(clear_start, clear_end):
-        for c in range(1, 18):
+        for c in range(1, max(N + 10, 20)):
             cell = ws.cell(row=r, column=c)
-            if isinstance(cell, MergedCell):
+            if isinstance(cell, _MergedCell):
                 continue
             cell.value  = None
-            cell.fill   = _ofill('FFFFFF')
-            cell.border = _oborder()
+            cell.fill   = _ofill(_C_WHITE)
+            cell.border = bdr
 
-    # Update subtitle row (row 2) with run metadata
-    ts     = datetime.datetime.now().strftime('%Y-%m-%d  %H:%M')
-    status = '✓  All checks passed' if ok else '⚠  Issues found — see console'
-    from openpyxl.styles import Font
+    # ── Title row ─────────────────────────────────────────────────────────────
+    ws.row_dimensions[1].height = 28
+    c1 = ws.cell(row=1, column=1)
+    c1.value     = 'ALLOCATION  —  solver_ilp output'
+    c1.font      = Font(name='Calibri', bold=True, size=14, color=_C_WHITE)
+    c1.fill      = _ofill(_C_TITLE)
+    c1.alignment = Alignment(horizontal='center', vertical='center')
+    ws.merge_cells(start_row=1, start_column=1, end_row=1,
+                   end_column=max(N + 5, 8))
+
+    ts         = _dt.datetime.now().strftime('%Y-%m-%d  %H:%M')
+    status_txt = '✓  All checks passed' if ok else '⚠  Issues found'
+    total_sets = mech_sets + opt_sets
     ws.cell(row=2, column=1).value = (
-        f'Last run: {ts}   |   {status}   |   '
-        f'{mech_sets} mech + {opt_sets} opt = {mech_sets + opt_sets} tooling sets'
+        f'Last run: {ts}   |   {status_txt}   |   '
+        f'{len(used_lines)} lines used   |   '
+        f'{mech_sets} mech + {opt_sets} opt = {total_sets} tooling sets'
     )
     ws.cell(row=2, column=1).font = Font(name='Calibri', italic=True,
-                                         size=10, color='595959')
+                                         size=9, color='595959')
+    ws.merge_cells(start_row=2, start_column=1, end_row=2,
+                   end_column=max(N + 5, 8))
+    ws.row_dimensions[2].height = 15
+    ws.row_dimensions[3].height = 6
+    ws.row_dimensions[4].height = 6
 
-    C_EVEN = 'E2EFDA'   # light green
-    C_ODD  = 'F0F8F0'   # slightly lighter green
+    # ── Column widths ──────────────────────────────────────────────────────────
+    ws.column_dimensions['A'].width = 8
+    for idx in range(N):
+        ws.column_dimensions[get_column_letter(2 + idx)].width = 14
+    extra_start = 2 + N
+    for i, w in enumerate([10, 14, 14, 12]):
+        ws.column_dimensions[get_column_letter(extra_start + i)].width = w
+
+    # ── Header row ─────────────────────────────────────────────────────────────
+    def _hdr(row, col, val):
+        c = ws.cell(row=row, column=col)
+        c.value     = val
+        c.font      = Font(name='Calibri', bold=True, size=10)
+        c.fill      = _ofill(_C_COLHDR)
+        c.border    = bdr
+        c.alignment = Alignment(horizontal='center', vertical='center')
+
+    ws.row_dimensions[ALLOC_HDR_ROW].height = 18
+    _hdr(ALLOC_HDR_ROW, 1, 'Year')
+    for idx, l in enumerate(used_lines):
+        _hdr(ALLOC_HDR_ROW, 2 + idx, f'L{l+1}')
+    _hdr(ALLOC_HDR_ROW, extra_start,     'Open\nLines')
+    _hdr(ALLOC_HDR_ROW, extra_start + 1, 'Total\nDemand')
+    _hdr(ALLOC_HDR_ROW, extra_start + 2, 'Total\nCapacity')
+    _hdr(ALLOC_HDR_ROW, extra_start + 3, 'Util %')
+
+    # ── Data rows ──────────────────────────────────────────────────────────────
     row = ALLOC_DATA_ROW
-    alt = False
     for yr in years:
-        d = demand.get(yr, [0] * 10)
-        if sum(d) == 0:
-            continue
-        active_lines = sorted({l for (y2, l, _) in alloc if y2 == yr})
-        for l in active_lines:
-            units  = [alloc.get((yr, l, p), 0) for p in range(NUM_PRODUCTS)]
-            total  = sum(units)
-            prods  = '+'.join(f'P{p+1}' for p in range(NUM_PRODUCTS)
-                              if units[p] > 0)
-            n_prod = sum(1 for p in range(NUM_PRODUCTS) if units[p] > 0)
-            t_used = sum(units[p] * ct[l][p] for p in range(NUM_PRODUCTS))
-            util   = round(t_used / avail * 100, 1)
-            oee_e  = int(round((BASE_OEE - CHANGEOVER_OEE_PENALTY
-                                if n_prod > 1 else BASE_OEE) * 100))
-            bg = C_ODD if alt else C_EVEN
+        d       = demand[yr]
+        tot_dem = sum(d)
+        n_open  = sum(1 for l in used_lines if l in intro and intro[l] <= yr)
 
-            vals = (
-                [yr, f'L{l+1}', intro.get(l, ''), prods]
-                + [units[p] if units[p] > 0 else None
-                   for p in range(NUM_PRODUCTS)]
-                + [total, util, oee_e]
-            )
-            for ci, v in enumerate(vals, 1):
-                cell            = ws.cell(row=row, column=ci)
-                cell.value      = v
-                cell.fill       = _ofill(bg)
-                cell.font       = _ofont(bold=(ci == 1))
-                cell.border     = _oborder()
-                cell.alignment  = _oal(
-                    'center' if ci <= 3 else
-                    'right'  if ci >= 5 else
-                    'left'
-                )
-                if ci >= 5 and ci <= 14:
-                    cell.number_format = '#,##0'
-                elif ci == 15:
-                    cell.number_format = '#,##0'
-                elif ci == 16:
-                    cell.number_format = '0.0'
-            ws.row_dimensions[row].height = 15
-            row += 1
-            alt = not alt
+        # Capacity of all open lines (OEE-adjusted)
+        tot_cap = 0
+        for l in used_lines:
+            if l not in intro or intro[l] > yr:
+                continue
+            units_l = [alloc.get((yr, l, p), 0) for p in range(NUM_PRODUCTS)]
+            n_prod  = sum(1 for p in range(NUM_PRODUCTS) if units_l[p] > 0)
+            oee_eff = BASE_OEE - (CHANGEOVER_OEE_PENALTY if n_prod > 1 else 0)
+            # Use the average cycle time for this line weighted by demand share
+            tot_ct  = sum(ct[l][p] * d[p] for p in range(NUM_PRODUCTS))
+            tot_d   = sum(d)
+            avg_ct  = (tot_ct / tot_d) if tot_d > 0 else 12
+            tot_cap += avail * oee_eff / avg_ct
+
+        util_pct = (tot_dem / tot_cap * 100) if tot_cap > 0 else 0
+
+        ws.row_dimensions[row].height = 18
+
+        # Year cell
+        c = ws.cell(row=row, column=1)
+        c.value     = yr
+        c.font      = Font(name='Calibri', bold=True, size=10)
+        c.fill      = _ofill(_C_RONLY)
+        c.border    = bdr
+        c.alignment = Alignment(horizontal='center', vertical='center')
+
+        # Line cells
+        for idx, l in enumerate(used_lines):
+            col  = 2 + idx
+            cell = ws.cell(row=row, column=col)
+            cell.border = bdr
+
+            if l not in intro or intro[l] > yr:
+                cell.fill  = _ofill(_C_WHITE)
+                cell.value = None
+                continue
+
+            prods = [p for p in range(NUM_PRODUCTS)
+                     if alloc.get((yr, l, p), 0) > 0]
+            if not prods:
+                # Open but idle this year
+                cell.fill      = _ofill('F2F2F2')
+                cell.value     = '—'
+                cell.font      = Font(name='Calibri', size=9, color='AAAAAA',
+                                      italic=True)
+                cell.alignment = Alignment(horizontal='center', vertical='center')
+            else:
+                label = ', '.join(f'P{p+1}' for p in prods)
+                multi = len(prods) > 1
+                cell.fill      = _ofill(_C_AMBER if multi else _C_GREEN)
+                cell.value     = label
+                cell.font      = Font(name='Calibri', size=9, bold=True)
+                cell.alignment = Alignment(horizontal='center', vertical='center',
+                                           wrap_text=True)
+
+        # Summary cells
+        def _sum_cell(col, val, fmt=None):
+            c = ws.cell(row=row, column=col)
+            c.value     = val
+            c.font      = Font(name='Calibri', size=10)
+            c.fill      = _ofill(_C_RONLY)
+            c.border    = bdr
+            c.alignment = Alignment(horizontal='right', vertical='center')
+            if fmt:
+                c.number_format = fmt
+
+        _sum_cell(extra_start,     n_open)
+        _sum_cell(extra_start + 1, tot_dem,  '#,##0')
+        _sum_cell(extra_start + 2, int(tot_cap), '#,##0')
+        _sum_cell(extra_start + 3, round(util_pct, 1), '0.0"%"')
+        row += 1
+
+    # ── Colour legend ──────────────────────────────────────────────────────────
+    row += 1
+    for color, label in [(_C_GREEN, 'Single-product line (no changeover)'),
+                         (_C_AMBER, 'Multi-product line (changeover penalty applies)'),
+                         ('F2F2F2', 'Line open but idle this year')]:
+        c = ws.cell(row=row, column=2)
+        c.fill   = _ofill(color)
+        c.value  = ''
+        c.border = bdr
+        c2 = ws.cell(row=row, column=3)
+        c2.value = label
+        c2.font  = Font(name='Calibri', italic=True, size=9, color='595959')
+        ws.row_dimensions[row].height = 14
+        row += 1
+
+    # ── Lines Used summary ─────────────────────────────────────────────────────
+    row += 1
+    ws.cell(row=row, column=1).value = 'LINES USED'
+    ws.cell(row=row, column=1).font  = Font(name='Calibri', bold=True, size=10,
+                                            color=_C_WHITE)
+    ws.cell(row=row, column=1).fill  = _ofill(_C_SECT)
+    ws.merge_cells(start_row=row, start_column=1, end_row=row,
+                   end_column=max(N + 5, 6))
+    ws.row_dimensions[row].height = 18
+    row += 1
+
+    for l in used_lines:
+        prods_ever = sorted(tooled[l])
+        n_p        = len(prods_ever)
+        oee_eff    = BASE_OEE - (CHANGEOVER_OEE_PENALTY if n_p > 1 else 0)
+        prod_labels = ', '.join(f'P{p+1}' for p in prods_ever)
+        label = (f'L{l+1}  intro={intro[l]}  products=[{prod_labels}]  '
+                 f'OEE={oee_eff*100:.0f}%  '
+                 f'tooling=[{mech_sets} mech / {opt_sets} opt total]')
+        ws.cell(row=row, column=1).value = label
+        ws.cell(row=row, column=1).font  = Font(name='Calibri', size=10)
+        ws.cell(row=row, column=1).fill  = _ofill(_C_RONLY)
+        ws.merge_cells(start_row=row, start_column=1, end_row=row,
+                       end_column=max(N + 5, 6))
+        ws.row_dimensions[row].height = 16
+        row += 1
+
+    # ── Cost Breakdown ─────────────────────────────────────────────────────────
+    row += 1
+    ws.cell(row=row, column=1).value = 'COST BREAKDOWN'
+    ws.cell(row=row, column=1).font  = Font(name='Calibri', bold=True, size=10,
+                                            color=_C_WHITE)
+    ws.cell(row=row, column=1).fill  = _ofill(_C_SECT)
+    ws.merge_cells(start_row=row, start_column=1, end_row=row,
+                   end_column=max(N + 5, 6))
+    ws.row_dimensions[row].height = 18
+    row += 1
+
+    n_lines_opened = len(used_lines)
+    cost_lines   = costs['line']       * n_lines_opened
+    cost_running = costs['running']    * n_line_years
+    cost_late    = (costs['upgrade'] + costs['validation']) * n_late_intros
+    cost_mech    = costs['mech']      * mech_sets
+    cost_opt     = costs['opt']       * opt_sets
+    total_cost   = cost_lines + cost_running + cost_late + cost_mech + cost_opt
+
+    breakdown = [
+        (f'New lines: {n_lines_opened} × ${costs["line"]:,.0f}',          cost_lines),
+        (f'Running:   {n_line_years} line-years × ${costs["running"]:,.0f}', cost_running),
+        (f'Late intros: {n_late_intros} × ${costs["upgrade"]+costs["validation"]:,.0f}', cost_late),
+        (f'Mech tooling: {mech_sets} sets × ${costs["mech"]:,.0f}',        cost_mech),
+        (f'Opt tooling:  {opt_sets} sets × ${costs["opt"]:,.0f}',          cost_opt),
+        ('TOTAL', total_cost),
+    ]
+    for label, val in breakdown:
+        bold = (label == 'TOTAL')
+        ws.cell(row=row, column=1).value = label
+        ws.cell(row=row, column=1).font  = Font(name='Calibri', bold=bold, size=10)
+        ws.cell(row=row, column=1).fill  = _ofill(_C_RONLY)
+        ws.merge_cells(start_row=row, start_column=1, end_row=row,
+                       end_column=max(N + 3, 5))
+        c = ws.cell(row=row, column=max(N + 4, 6))
+        c.value         = val
+        c.font          = Font(name='Calibri', bold=bold, size=10)
+        c.fill          = _ofill(_C_RONLY)
+        c.number_format = '$#,##0'
+        c.alignment     = Alignment(horizontal='right')
+        ws.row_dimensions[row].height = 16
+        row += 1
 
     return row - ALLOC_DATA_ROW
 
@@ -1096,7 +1271,8 @@ def main():
     print('\nWriting outputs to workbook ...')
     outdir = path.parent
 
-    n_rows = write_output(wb, alloc, tooled, intro, inp, mech_sets, opt_sets, ok)
+    n_rows = write_output(wb, alloc, tooled, intro, inp, mech_sets, opt_sets,
+                          n_line_years, n_late_intros, ok)
     print(f'  Allocation sheet: {n_rows} rows written')
 
     write_report_sheet(wb, alloc, tooled, intro, mech_fams, opt_fams,
